@@ -1755,13 +1755,16 @@ func (bc *BlockChain) InsertChain(chain types.Blocks) (int, error) {
 // completes, then the historic state could be pruned again
 func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool, makeWitness bool) (*stateless.Witness, int, error) {
 	// If the chain is terminating, don't even bother starting up.
+	// If the blockchain is in a stopped state (e.g., shutting down), abort insertion early
 	if bc.insertStopped() {
 		return nil, 0, nil
 	}
 
+	// Increment block processing counter and notify listeners this node is busy processing blocks
 	if atomic.AddInt32(&bc.blockProcCounter, 1) == 1 {
 		bc.blockProcFeed.Send(true)
 	}
+	// Ensure the counter decrements and notifies when processing ends
 	defer func() {
 		if atomic.AddInt32(&bc.blockProcCounter, -1) == 0 {
 			bc.blockProcFeed.Send(false)
@@ -1769,31 +1772,61 @@ func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool, makeWitness 
 	}()
 
 	// Start a parallel signature recovery (signer will fluke on fork transition, minimal perf loss)
+	/*
+		Every Ethereum transaction is signed by a private key, but does not explicitly include the sender’s address. Instead,
+		the sender's address is derived by recovering the public key from the transaction's digital signature using elliptic
+		curve cryptography (secp256k1 curve).
+
+		Instead of recovering transaction senders one by one during block execution (which is expensive), this step recovers
+		all senders in parallel beforehand for all blocks in the batch. This cached information is then used during block execution
+		to speed up verification and validation.
+	*/
 	SenderCacher().RecoverFromBlocks(types.MakeSigner(bc.chainConfig, chain[0].Number(), chain[0].Time()), chain)
 
+	// Initialize import stats and a variable to track the last canonical block inserted
 	var (
 		stats     = insertStats{startTime: mclock.Now()}
 		lastCanon *types.Block
 	)
+
 	// Fire a single chain head event if we've progressed the chain
+	// Once this function execution finishes, if we inserted a new block, notify chain head subscribers
 	defer func() {
 		if lastCanon != nil && bc.CurrentBlock().Hash() == lastCanon.Hash() {
 			bc.chainHeadFeed.Send(ChainHeadEvent{Header: lastCanon.Header()})
 		}
 	}()
+
 	// Start the parallel header verifier
+	// Prepare block headers slice for bulk verification
 	headers := make([]*types.Header, len(chain))
 	for i, block := range chain {
 		headers[i] = block.Header()
 	}
+
+	// Run asynchronous header verification
+	// VerifyHeaders runs asynchronous verification on a batch of ordered, continuous block headers,
+	// returning two channels:
+	//
+	// - An abort channel (chan<- struct{}) which can be closed to cancel the verification early.
+	// - A results channel (<-chan error) that streams verification results (errors or nil for success) for each header.
+	//
+	// The caller listens on the results channel to process verification outcomes as they arrive,
+	// and can signal abort if necessary to stop ongoing verification.
+	//
+	// This allows concurrent, cancellable header verification improving import performance.
 	abort, results := bc.engine.VerifyHeaders(bc, headers)
 	defer close(abort)
 
 	// Peek the error for the first block to decide the directing import logic
+	// Create iterator to walk blocks alongside verification results
 	it := newInsertIterator(chain, results, bc.validator)
+	// Get first block and error from iterator
 	block, err := it.next()
 
 	// Left-trim all the known blocks that don't need to build snapshot
+	// skipBlock returns 'true', if the block being imported can be skipped over, meaning
+	// that the block does not need to be processed but can be considered already fully 'done'.
 	if bc.skipBlock(err, it) {
 		// First block (and state) is known
 		//   1. We did a roll-back, and should now do a re-import
@@ -1801,13 +1834,38 @@ func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool, makeWitness 
 		//      from the canonical chain, which has not been verified.
 		// Skip all known blocks that are behind us.
 		current := bc.CurrentBlock()
+		// Loop to skip all known blocks up to current chain head
 		for block != nil && bc.skipBlock(err, it) {
+			// We only skip blocks that are before or equal to the current canonical head number.
+			// - We ensure the block matches the canonical chain at that height.
+			// - If the block is ahead of the current head or differs from the canonical chainhash,
+			//   it means this block belongs to a different fork or a future extension,
+			//   so we stop skipping and start processing normally.
+			/*
+				Example scenario:
+
+				This checks if either:
+				1. The incoming block number is greater than the current local canonical head number (meaning it's new or extends beyond what we have).
+				2. The block hash at that number does not match the locally known canonical hash (indicating a fork or chain divergence).
+
+				If either is true, the loop breaks, stopping skipping. That causes import to start processing these blocks fully.
+
+				In your example, since your local canonical head is at 1205, the first incoming block `1200` to `1205` can be skipped (if hashes match). However, because blocks `1206` to `1298` are missing locally, skipping cannot continue when the code hits `1206` (or `1206` onwards).
+
+				Thus, skipping ends before `1206` and blocks from `1206` to `1310` are processed to update the local chain.
+
+				This mechanism:
+				- Efficiently avoids re-processing blocks already known and verified.
+				- Ensures missing or new chain data are correctly imported.
+				- Maintains sync between your local chain and the network’s canonical chain over time.
+			*/
 			if block.NumberU64() > current.Number.Uint64() || bc.GetCanonicalHash(block.NumberU64()) != block.Hash() {
 				break
 			}
 			log.Debug("Ignoring already known block", "number", block.Number(), "hash", block.Hash())
 			stats.ignored++
 
+			// Get next block from iterator
 			block, err = it.next()
 		}
 		// The remaining blocks are still known blocks, the only scenario here is:
@@ -1818,8 +1876,29 @@ func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool, makeWitness 
 		// When node runs a snap sync again, it can re-import a batch of known blocks via
 		// `insertChain` while a part of them have higher total difficulty than current
 		// head full block(new pivot point).
+		/*
+			The remaining blocks are still known blocks, the only scenario here is:
+			During snap sync, the node reaches a pivot point (e.g., block 500), but a rollback occurs
+			(due to some network errors, invalid data, or a detected fork), resetting the node's chain head
+			back to an earlier block (e.g., 480). Despite rollback, blocks from 481 up to 500 may remain stored locally as "known blocks".
+
+			When the node resumes snap sync, it can receive a batch that includes these known blocks,
+			possibly ahead of its current chain head (480).
+			The node must re-import these blocks to ensure consistency of its chain database.
+		*/
 		for block != nil && bc.skipBlock(err, it) {
 			log.Debug("Writing previously known block", "number", block.Number(), "hash", block.Hash())
+			// writeKnownBlock updates the local blockchain's head pointer to the given known block.
+			// If the parent of the given block is not the current head, it triggers a chain reorganization
+			// to switch the active canonical chain to reflect the new chain segment.
+			//
+			// This ensures that if the known block extends a different fork, the local chain reorganizes accordingly,
+			// maintaining consensus with the network's best chain.
+			// Example:
+			// - Current head is block 1000
+			// - A known block 1001 arrives
+			// - If 1001's parent hash matches 1000's hash, just update the head to block 1001
+			// - Otherwise, reorganize the chain to switch to the branch that includes block 1001
 			if err := bc.writeKnownBlock(block); err != nil {
 				return nil, it.index, err
 			}
@@ -1828,16 +1907,47 @@ func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool, makeWitness 
 			block, err = it.next()
 		}
 		// Falls through to the block import
+		// After this, ready to continue to import new blocks
 	}
 	switch {
 	// First block is pruned
 	case errors.Is(err, consensus.ErrPrunedAncestor):
 		if setHead {
 			// First block is pruned, insert as sidechain and reorg only if TD grows enough
+			// Insert as sidechain and trigger reorg if needed
+			/*
+				- Local canonical chain tip is block 1000.
+				- Sidechain fork starts at block 950.
+				- Ancestor state before 950 is pruned.
+				- The method allows importing this sidechain by writing blocks without full state checks,
+					attempting to recover pruned state, and potentially switching to the sidechain.
+
+				The method writes all (header-and-body-valid) blocks to disk without full state execution,
+				then tries to switch the canonical chain if the sidechain's total difficulty exceeds the current chain.
+			*/
 			log.Debug("Pruned ancestor, inserting as sidechain", "number", block.Number(), "hash", block.Hash())
+			// This logic is specific to pre-Merge Ethereum clients
 			return bc.insertSideChain(block, it, makeWitness)
 		} else {
 			// We're post-merge and the parent is pruned, try to recover the parent state
+			// Attempt to recover missing ancestor state
+			/*
+				// recoverAncestors finds the closest ancestor block with available state
+				// and re-executes all ancestor blocks from there up to the given block.
+				// This method is used **post-Merge**, reflecting the updated syncing logic.
+				// It returns the hash of the latest successfully validated block.
+				//
+				// Example scenario:
+				// - Suppose our local node fails to find the state for block 1300 (pruned or missing).
+				// - The method walks backwards from block 1300 to find the nearest ancestor
+				//   that has the available state (say, block 1295).
+				// - It recovers any recoverable state roots, then replays blocks 1296 to 1300 sequentially
+				//   to reconstruct its state.
+				// - This ensures the node's state is consistent and up-to-date up to block 1300.
+				//
+				// This method orchestrates selective block replay to recover from missing states,
+				// avoiding full chain re-sync and enabling robust post-Merge operation.
+			*/
 			log.Debug("Pruned ancestor", "number", block.Number(), "hash", block.Hash())
 			_, err := bc.recoverAncestors(block, makeWitness)
 			return nil, it.index, err
@@ -1846,15 +1956,19 @@ func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool, makeWitness 
 	// ErrKnownBlock is allowed here since some known blocks
 	// still need re-execution to generate snapshots that are missing
 	case err != nil && !errors.Is(err, ErrKnownBlock):
+		// Abort on other errors except for known blocks
 		stats.ignored += len(it.chain)
 		bc.reportBlock(block, nil, err)
 		return nil, it.index, err
 	}
 	// Track the singleton witness from this chain insertion (if any)
+	// Container to hold witness if generated
 	var witness *stateless.Witness
 
+	// Loop over remaining blocks to process or re-execute
 	for ; block != nil && err == nil || errors.Is(err, ErrKnownBlock); block, err = it.next() {
 		// If the chain is terminating, stop processing blocks
+		// Stop early if insertion is aborted externally
 		if bc.insertStopped() {
 			log.Debug("Abort during block processing")
 			break
@@ -1888,10 +2002,25 @@ func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool, makeWitness 
 				log.Error("Please file an issue, skip known block execution without receipt",
 					"hash", block.Hash(), "number", block.NumberU64())
 			}
+			// Write known block to DB
+			// writeKnownBlock updates the local blockchain's head pointer to the given known block.
+			// If the parent of the given block is not the current head, it triggers a chain reorganization
+			// to switch the active canonical chain to reflect the new chain segment.
+			//
+			// This ensures that if the known block extends a different fork, the local chain reorganizes accordingly,
+			// maintaining consensus with the network's best chain.
+			// Example:
+			// - Current head is block 1000
+			// - A known block 1001 arrives
+			// - If 1001's parent hash matches 1000's hash, just update the head to block 1001
+			// - Otherwise, reorganize the chain to switch to the branch that includes block 1001
 			if err := bc.writeKnownBlock(block); err != nil {
 				return nil, it.index, err
 			}
 			stats.processed++
+			// Invoke callback if set:
+			// If a logger is configured and it has an OnSkippedBlock callback,
+			// notify the system that a block has been skipped.
 			if bc.logger != nil && bc.logger.OnSkippedBlock != nil {
 				bc.logger.OnSkippedBlock(tracing.BlockEvent{
 					Block:     block,
@@ -1901,41 +2030,72 @@ func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool, makeWitness 
 			}
 			// We can assume that logs are empty here, since the only way for consecutive
 			// Clique blocks to have the same state is if there are no transactions.
+			// Assume logs empty (no transactions in the block),
+			// and mark this block as the last canonical block seen.
 			lastCanon = block
 			continue
 		}
 		// Retrieve the parent block and it's state to execute on top
+		// Get parent block state root, used for block execution
 		parent := it.previous()
 		if parent == nil {
 			parent = bc.GetHeader(block.ParentHash(), block.NumberU64()-1)
 		}
 		// The traced section of block import.
+		// Mark start time for processing block
 		start := time.Now()
+
+		// Execute block transactions and state transitions
+		// ProcessBlock executes and validates the given block using the specified parent state root.
+		// If successful, it writes the block and the resulting updated state to the database.
+		//
+		// Parameters:
+		// - parentRoot: the root hash of the parent block's state to start execution from
+		// - block: the block to be processed and validated
+		// - setHead: indicates whether this block should become the new canonical chain head after processing
+		// - makeWitness: indicates whether to generate a stateless witness during execution (optional)
+		//
+		// Example:
+		// ProcessBlock(parentRootOfBlock1001, block1001, false, true)
+		// - Recreates the state at block 1001 from its parent's root
+		// - Replays all transactions in block 1001
+		// - Validates the resulting state root matches the block header
+		// - Writes block 1001 and new state to the database
 		res, err := bc.ProcessBlock(parent.Root, block, setHead, makeWitness && len(chain) == 1)
 		if err != nil {
 			return nil, it.index, err
 		}
 		// Report the import stats before returning the various results
+		// Update import stats
 		stats.processed++
 		stats.usedGas += res.usedGas
 		witness = res.witness
 
+		// Obtain current snapshot and trie diff sizes for reporting
 		var snapDiffItems, snapBufItems common.StorageSize
 		if bc.snaps != nil {
+			// Size returns two metrics related to the memory usage in the snapshot diff layers:
+			// 1. snapDiffItems: the memory used by the diff layers stacked above the persistent disk layer,
+			//    which track changes not yet committed to disk. This represents the "dirty" or in-memory state changes.
+			// 2. snapBufItems: currently always zero because the implementation uses a special diff layer
+			//    as an aggregator acting like an in-memory dirty buffer.
 			snapDiffItems, snapBufItems = bc.snaps.Size()
 		}
 		trieDiffNodes, trieBufNodes, _ := bc.triedb.Size()
+		// Report import statistics
 		stats.report(chain, it.index, snapDiffItems, snapBufItems, trieDiffNodes, trieBufNodes, setHead)
 
 		// Print confirmation that a future fork is scheduled, but not yet active.
 		bc.logForkReadiness(block)
 
+		// If we are not setting canonical head, return early
 		if !setHead {
 			// After merge we expect few side chains. Simply count
 			// all blocks the CL gives us for GC processing time
 			bc.gcproc += res.procTime
 			return witness, it.index, nil // Direct block insertion of a single block
 		}
+		// Log block insertion status
 		switch res.status {
 		case CanonStatTy:
 			log.Debug("Inserted new block", "number", block.Number(), "hash", block.Hash(),
@@ -1964,7 +2124,9 @@ func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool, makeWitness 
 		}
 	}
 
+	// Add any remaining skipped blocks to ignored stats
 	stats.ignored += it.remaining()
+	// Return witness proofs (if any), index of last processed block, and error
 	return witness, it.index, err
 }
 
@@ -1985,14 +2147,17 @@ func (bpr *blockProcessingResult) Witness() *stateless.Witness {
 // it writes the block and associated state to database.
 func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, setHead bool, makeWitness bool) (_ *blockProcessingResult, blockEndErr error) {
 	var (
-		err       error
-		startTime = time.Now()
-		statedb   *state.StateDB
-		interrupt atomic.Bool
+		err       error          // Holds errors during processing
+		startTime = time.Now()   // Timestamp block processing start for metrics
+		statedb   *state.StateDB // State database interface to track world state
+		interrupt atomic.Bool    // Flag to signal cancellation for prefetch
 	)
+	// Ensure that prefetcher is stopped when function returns
 	defer interrupt.Store(true) // terminate the prefetch at the end
 
+	// --- StateDB Initialization ---
 	if bc.cfg.NoPrefetch {
+		// If prefetch disabled, initialize stateDB directly from parent root
 		statedb, err = state.New(parentRoot, bc.statedb)
 		if err != nil {
 			return nil, err
@@ -2003,10 +2168,44 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 		//
 		// Note: the main processor and prefetcher share the same reader with a local
 		// cache for mitigating the overhead of state access.
+		/*
+			ReadersWithCacheStats creates two readers for the same state root.
+
+			- Both readers share one common cache to avoid loading the same data twice.
+			- Each reader tracks its own cache hits and misses separately.
+			- This way, the prefetcher and the main processor can read from the cache efficiently,
+			  while separately monitoring their cache usage.
+			- Helps optimize performance by avoiding duplicate reads and provides clear stats for tuning.
+
+			Example:
+			- Prefetcher uses one reader to load trie nodes ahead.
+			- Processor uses the other to process transactions immediately.
+			- Shared cache reduces disk IO, but separate stats show which part benefits how much.
+		*/
 		prefetch, process, err := bc.statedb.ReadersWithCacheStats(parentRoot)
 		if err != nil {
 			return nil, err
 		}
+		/*
+			// NewWithReader creates a new state for the specified state root. Unlike New,
+			// this function accepts an additional Reader which is bound to the given root.
+
+			- root: the Merkle root hash representing the state snapshot to load.
+			- db: the underlying database interface for persistent storage.
+			- reader: a Reader bound to the given root that allows accessing trie data.
+
+			The returned StateDB:
+			- Keeps track of account and contract state objects.
+			- Manages state changes (mutations), logs, journaling, and access lists.
+			- Supports new features like Verkle trees if enabled.
+			- Provides an isolated interface to interact with and modify the Ethereum state.
+
+			Use case:
+			- Used during block processing to execute transactions starting from a known state root.
+			- Different from New(), this lets you specify a custom Reader, useful for layered caching or prefetching.
+
+			This function is essential to create the environment where contract code executes and state transitions are applied.
+		*/
 		throwaway, err := state.NewWithReader(parentRoot, bc.statedb, prefetch)
 		if err != nil {
 			return nil, err
@@ -2016,6 +2215,7 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 			return nil, err
 		}
 		// Upload the statistics of reader at the end
+		// upload of cache hit/miss statistics for performance monitoring at end of function
 		defer func() {
 			stats := prefetch.GetStats()
 			accountCacheHitPrefetchMeter.Mark(stats.AccountHit)
@@ -2029,8 +2229,19 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 			storageCacheMissMeter.Mark(stats.StorageMiss)
 		}()
 
+		// Run prefetch asynchronously (parallel) to warm the state database cache
+		/*
+			This code runs the prefetch task in the background to prepare the cache with all the data that
+			will be needed when processing the block later. It goes through the block’s transactions without
+			making any real changes but loads all the relevant account states, storage data, and signatures into
+			memory so that when the real processing happens, it can run faster without waiting for the data to be
+			fetched from disk or database. Tracing is turned off during prefetching to reduce overhead. The code also
+			tracks how long the prefetch took and whether it was interrupted. Overall, prefetching is like warming up
+			the system by loading important information ahead of time to make the actual work smoother and quicker.
+		*/
 		go func(start time.Time, throwaway *state.StateDB, block *types.Block) {
 			// Disable tracing for prefetcher executions.
+			// Disable tracing for prefetch to avoid overhead
 			vmCfg := bc.cfg.VmConfig
 			vmCfg.Tracer = nil
 			bc.prefetcher.Prefetch(block, throwaway, vmCfg, &interrupt)
@@ -2045,27 +2256,47 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 	// If we are past Byzantium, enable prefetching to pull in trie node paths
 	// while processing transactions. Before Byzantium the prefetcher is mostly
 	// useless due to the intermediate root hashing after each transaction.
+	// --- Witness Generation Setup (Post-Byzantium) ---
 	var (
-		witness      *stateless.Witness
+		// Witness encompasses the state required to apply a set of transactions and derive a post state/receipt root
+		witness *stateless.Witness
+		// WitnessStats aggregates statistics for account and storage trie accesses.
 		witnessStats *stateless.WitnessStats
 	)
+	// IsByzantium returns whether num is either equal to the Byzantium fork block or greater.
 	if bc.chainConfig.IsByzantium(block.Number()) {
 		// Generate witnesses either if we're self-testing, or if it's the
 		// only block being inserted. A bit crude, but witnesses are huge,
 		// so we refuse to make an entire chain of them.
 		if bc.cfg.VmConfig.StatelessSelfValidation || makeWitness {
+			/*
+				NewWitness creates an empty witness structure for a given block header.
+
+				- It fetches the block’s parent header (if available) to include as trust anchor.
+				- The parent header acts as a pre-verified reference point for state validation.
+				- It initializes empty maps to store parts of the block’s code and state that will be included in the witness.
+				- The witness contains minimal information needed to verify the block’s state transitions without storing the full state.
+				- This supports stateless clients that rely on these witnesses instead of the entire blockchain state.
+			*/
 			witness, err = stateless.NewWitness(block.Header(), bc)
 			if err != nil {
 				return nil, err
 			}
 			if bc.cfg.VmConfig.EnableWitnessStats {
+				// NewWitnessStats creates a new WitnessStats collector.
 				witnessStats = stateless.NewWitnessStats()
 			}
 		}
+		// StartPrefetcher initializes a new trie prefetcher to pull in nodes from the
+		// state trie concurrently while the state is mutated so that when we reach the
+		// commit phase, most of the needed data is already hot.
 		statedb.StartPrefetcher("chain", witness, witnessStats)
+		// StopPrefetcher terminates a running prefetcher and reports any leftover stats
+		// from the gathered metrics. at the end execute this function StopPrefetcher
 		defer statedb.StopPrefetcher()
 	}
 
+	// --- Logging: Notify Start and End of Block Processing ---
 	if bc.logger != nil && bc.logger.OnBlockStart != nil {
 		bc.logger.OnBlockStart(tracing.BlockEvent{
 			Block:     block,
@@ -2079,20 +2310,57 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 		}()
 	}
 
+	// --- Execute EVM Transactions and State Changes ---
 	// Process block using the parent state as reference point
 	pstart := time.Now()
+	// Process processes the state changes according to the Ethereum rules by running
+	// the transaction messages using the statedb and applying any rewards to both
+	// the processor (coinbase) and any included uncles.
+	/*
+		Process executes all state changes for a given block according to Ethereum rules.
+		It runs each transaction in the block, updating the provided statedb with all resulting state changes,
+		and applies block rewards to the miner (coinbase) and uncles.
+
+		Key points:
+		- Returns:
+			- Receipts detailing transaction execution outcomes and logs produced.
+			- Gas used by all transactions combined.
+		- Returns errors if any transaction fails due to insufficient gas or other issues.
+
+		this method fully processes a block's transactions and related state transitions,
+		ensuring that all Ethereum protocol rules, upgrades, and consensus requirements are followed.
+	*/
 	res, err := bc.processor.Process(block, statedb, bc.cfg.VmConfig)
 	if err != nil {
+		// reportBlock logs a bad block error.
 		bc.reportBlock(block, res, err)
 		return nil, err
 	}
+	// Record execution time
 	ptime := time.Since(pstart)
 
+	// --- Validate Post-execution State ---
 	vstart := time.Now()
+	/*
+		ValidateState checks that all important state changes in a block match what the protocol expects.
+
+		Main checks performed:
+		- Make sure gas used in processing matches what the block header claims.
+		- Ensure the bloom filter from transaction receipts matches the one in the header.
+		- In stateless mode, stop here because roots aren’t directly available.
+		- Otherwise, confirm that the receipts root (Merkle hash of all transaction receipts) matches the block header.
+		- For newer forks (Prague), also check new “requests” hash fields if present.
+		- Finally, make sure the calculated state root after processing matches the root hash from the block header.
+		- If any mismatches or errors occur, return a clear error detailing what went wrong.
+
+		In short, this function is a final pass to verify the block’s processing results line up with the block’s
+		declared values and that no tampering or mistakes occurred.
+	*/
 	if err := bc.validator.ValidateState(block, statedb, res, false); err != nil {
 		bc.reportBlock(block, res, err)
 		return nil, err
 	}
+	// Validation time
 	vtime := time.Since(vstart)
 
 	// If witnesses was generated and stateless self-validation requested, do
@@ -2101,32 +2369,49 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 	// witness builder/runner, which would otherwise be impossible due to the
 	// various invalid chain states/behaviors being contained in those tests.
 	xvstart := time.Now()
+	// Check if the state database has a witness and if stateless self-validation is enabled.
+	// This ensures the validation only runs during testing or special modes.
 	if witness := statedb.Witness(); witness != nil && bc.cfg.VmConfig.StatelessSelfValidation {
 		log.Warn("Running stateless self-validation", "block", block.Number(), "hash", block.Hash())
 
 		// Remove critical computed fields from the block to force true recalculation
+		// Make a copy of the block's header and clear its state root and receipt root fields.
+		// This forces the validation process to recalculate these roots from scratch,
+		// ensuring that the roots are truly verified and not just reused.
 		context := block.Header()
 		context.Root = common.Hash{}
 		context.ReceiptHash = common.Hash{}
 
+		// Create a new block based on the cleared header and the original block's transactions.
+		// This rebuilt block will be used in the stateless validation process.
 		task := types.NewBlockWithHeader(context).WithBody(*block.Body())
 
-		// Run the stateless self-cross-validation
+		// Run stateless execution of the block using only the witness.
+		// This simulates running the block without the full node state,
+		// returning the recalculated state root and receipt root.
 		crossStateRoot, crossReceiptRoot, err := ExecuteStateless(bc.chainConfig, bc.cfg.VmConfig, task, witness)
+		// If the stateless execution fails, return an error indicating self-validation failed.
 		if err != nil {
 			return nil, fmt.Errorf("stateless self-validation failed: %v", err)
 		}
+		// Check if the recalculated state root matches the state root in the original block.
+		// If not, it means the stateless validation failed to reproduce the expected state.
 		if crossStateRoot != block.Root() {
 			return nil, fmt.Errorf("stateless self-validation root mismatch (cross: %x local: %x)", crossStateRoot, block.Root())
 		}
+		// Check if the recalculated receipt root matches the receipt root in the original block.
+		// A mismatch means the receipts generated by stateless execution do not match the expected ones.
 		if crossReceiptRoot != block.ReceiptHash() {
 			return nil, fmt.Errorf("stateless self-validation receipt root mismatch (cross: %x local: %x)", crossReceiptRoot, block.ReceiptHash())
 		}
 	}
 
-	xvtime := time.Since(xvstart)
+	xvtime := time.Since(xvstart) // Self-validation time
+
+	// --- Total Processing Time ---
 	proctime := time.Since(startTime) // processing + validation + cross validation
 
+	// --- Update Performance Metrics ---
 	// Update the metrics touched during block processing and validation
 	accountReadTimer.Update(statedb.AccountReads) // Account reads are complete(in processing)
 	storageReadTimer.Update(statedb.StorageReads) // Storage reads are complete(in processing)
@@ -2145,6 +2430,7 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 	blockValidationTimer.Update(vtime - (triehash + trieUpdate))                      // The time spent on block validation
 	blockCrossValidationTimer.Update(xvtime)                                          // The time spent on stateless cross validation
 
+	// --- Commit block and state to database ---
 	// Write the block to the chain and get the status.
 	var (
 		wstart = time.Now()
@@ -2152,8 +2438,10 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 	)
 	if !setHead {
 		// Don't set the head, only insert the block
+		// Insert block and state but don't update chain head
 		err = bc.writeBlockWithState(block, res.Receipts, statedb)
 	} else {
+		// Insert block and set as canonical chain head
 		status, err = bc.writeBlockAndSetHead(block, res.Receipts, res.Logs, statedb, false)
 	}
 	if err != nil {
@@ -2164,6 +2452,7 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 		witnessStats.ReportMetrics(block.NumberU64())
 	}
 
+	// --- Update Commit Timers ---
 	// Update the metrics touched during block commit
 	accountCommitTimer.Update(statedb.AccountCommits)   // Account commits are complete, we can mark them
 	storageCommitTimer.Update(statedb.StorageCommits)   // Storage commits are complete, we can mark them
@@ -2172,12 +2461,14 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 
 	blockWriteTimer.Update(time.Since(wstart) - max(statedb.AccountCommits, statedb.StorageCommits) /* concurrent */ - statedb.SnapshotCommits - statedb.TrieDBCommits)
 	elapsed := time.Since(startTime) + 1 // prevent zero division
-	blockInsertTimer.Update(elapsed)
+	blockInsertTimer.Update(elapsed)     // Total insert duration
 
 	// TODO(rjl493456442) generalize the ResettingTimer
+	// Calculate and update gas throughput metric (milligas per second)
 	mgasps := float64(res.GasUsed) * 1000 / float64(elapsed)
 	chainMgaspsMeter.Update(time.Duration(mgasps))
 
+	// --- Return processing result ---
 	return &blockProcessingResult{
 		usedGas:  res.GasUsed,
 		procTime: proctime,
@@ -2565,12 +2856,19 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 // updating. It relies on the additional SetCanonical call to finalize the entire
 // procedure.
 func (bc *BlockChain) InsertBlockWithoutSetHead(block *types.Block, makeWitness bool) (*stateless.Witness, error) {
+	// Attempt to acquire exclusive lock on the blockchain state.
+	// If unable (e.g., database is closed), return an error indicating the chain is stopped.
 	if !bc.chainmu.TryLock() {
 		return nil, errChainStopped
 	}
+	// Ensure the lock is released when function completes
 	defer bc.chainmu.Unlock()
 
+	// Call internal insertChain with this one block, without updating canonical chain head,
+	// and with witness generation flag passed along.
 	witness, _, err := bc.insertChain(types.Blocks{block}, false, makeWitness)
+
+	// Return any generated witness and error encountered during insertion.
 	return witness, err
 }
 

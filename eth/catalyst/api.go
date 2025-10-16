@@ -641,6 +641,28 @@ func (api *ConsensusAPI) NewPayloadV3(params engine.ExecutableData, versionedHas
 }
 
 // NewPayloadV4 creates an Eth1 block, inserts it in the chain, and returns the status of the chain.
+/*
+// This function translates consensus-originating payloads (the "execution block"
+// data extracted from beacon blocks) into Eth1 blocks, performs validation
+// and state transitions, and persists the result accordingly.
+//
+// Parameters:
+//   - params:            The full execution block data (header fields, txs,
+//                        withdrawals, gas info), as specified by the Engine API and recent protocol upgrades.
+//   - versionedHashes:   List of blob hashes used for proto-danksharding and
+//                        blob transaction tracking (required in latest epochs).
+//   - beaconRoot:        The hash of the parent beacon block, linking the
+//                        execution payload to consensus (for cross-layer consistency).
+//   - executionRequests: Advanced protocol extensions which may drive stateless
+//                        execution, provide additional proofs, or support future forks.
+//
+// Returns:
+//   - engine.PayloadStatusV1: Enum status indicating whether the payload was accepted
+//                        (VALID), rejected (INVALID), or needs to be retried
+//                        (SYNCING/ACCEPTED). Also may provide the latest valid block hash and witness/proof info if requested.
+//
+// Typical usage: Called by the Consensus Layer (CL) each time a beacon block is validated, with the execution payload extracted and sent over the Engine API to the Execution Layer (EL, e.g. Geth), which then processes and stores the block.
+*/
 func (api *ConsensusAPI) NewPayloadV4(params engine.ExecutableData, versionedHashes []common.Hash, beaconRoot *common.Hash, executionRequests []hexutil.Bytes) (engine.PayloadStatusV1, error) {
 	switch {
 	case params.Withdrawals == nil:
@@ -679,12 +701,21 @@ func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashe
 	//    sequentially.
 	// Hence, we use a lock here, to be sure that the previous call has finished before we
 	// check whether we already have the block locally.
+
+	/*
+		// Lock to prevent concurrent imports of the same block that could cause race conditions,
+		// especially during DB compaction which can block InsertBlockWithoutSetHead.
+	*/
 	api.newPayloadLock.Lock()
 	defer api.newPayloadLock.Unlock()
 
+	// Log receipt of new payload with number and hash for debugging
 	log.Trace("Engine API request received", "method", "NewPayload", "number", params.Number, "hash", params.BlockHash)
+
+	// Convert the Engine API payload and associated data into an internal Ethereum block structure
 	block, err := engine.ExecutableDataToBlock(params, versionedHashes, beaconRoot, requests)
 	if err != nil {
+		// If conversion fails, log detailed warning with all payload fields to help debug input issues
 		bgu := "nil"
 		if params.BlobGasUsed != nil {
 			bgu = strconv.Itoa(int(*params.BlobGasUsed))
@@ -713,19 +744,27 @@ func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashe
 			"beaconRoot", beaconRoot,
 			"len(requests)", len(requests),
 			"error", err)
+		// Return invalid payload status, no error (handled by caller)
 		return api.invalid(err, nil), nil
 	}
 	// Stash away the last update to warn the user if the beacon client goes offline
+	// Store the timestamp of this successful payload update for monitoring and alerting CL connectivity
 	api.lastNewPayloadUpdate.Store(time.Now().Unix())
 
 	// If we already have the block locally, ignore the entire execution and just
 	// return a fake success.
+	// Check if block already exists locally to avoid reprocessing duplicate payloads
 	if block := api.eth.BlockChain().GetBlockByHash(params.BlockHash); block != nil {
 		log.Warn("Ignoring already known beacon payload", "number", params.Number, "hash", params.BlockHash, "age", common.PrettyAge(time.Unix(int64(block.Time()), 0)))
 		hash := block.Hash()
 		return engine.PayloadStatusV1{Status: engine.VALID, LatestValidHash: &hash}, nil
 	}
 	// If this block was rejected previously, keep rejecting it
+	/*
+		// The function looks up the block hash and its ancestors in a tracking map of known
+		// invalid blocks. If a match is found, it returns an "INVALID" payload status, so the
+		// new block is rejected early without wasting resources on further execution or storage.
+	*/
 	if res := api.checkInvalidAncestor(block.Hash(), block.Hash()); res != nil {
 		return *res, nil
 	}
@@ -735,10 +774,23 @@ func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashe
 	// our live chain. As such, payload execution will not permit reorgs and thus
 	// will not trigger a sync cycle. That is fine though, if we get a fork choice
 	// update after legit payload executions.
+	/* Check if parent block is missing, avoid triggering sync or reorg here — delay import until next forkchoice update */
 	parent := api.eth.BlockChain().GetBlock(block.ParentHash(), block.NumberU64()-1)
 	if parent == nil {
+		/*
+			// delayPayloadImport temporarily stores a received block to be processed later instead of immediately.
+			// This happens when the block appears valid but cannot be imported yet because prerequisites are missing,
+			// such as the parent block not being available locally, or if the node is still syncing (e.g., snap sync).
+			//
+			// Rather than rejecting the block outright, it saves it safely so it can be imported once the required data
+			// arrives or after a forkchoice update triggers a sync. This allows smoother syncing by deferring block execution
+			// until the node is ready, avoiding wasted work or errors due to missing context.
+		*/
 		return api.delayPayloadImport(block), nil
 	}
+	/*
+		// Validate timestamp is strictly greater than parent block timestamp
+	*/
 	if block.Time() <= parent.Time() {
 		log.Warn("Invalid timestamp", "parent", block.Time(), "block", block.Time())
 		return api.invalid(errors.New("invalid timestamp"), parent.Header()), nil
@@ -747,19 +799,35 @@ func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashe
 	// tries to make it import a block. That should be denied as pushing something
 	// into the database directly will conflict with the assumptions of snap sync
 	// that it has an empty db that it can fill itself.
+	/* Disallow block import during snap sync mode; only allowed during full sync */
 	if api.eth.SyncMode() != ethconfig.FullSync {
 		return api.delayPayloadImport(block), nil
 	}
+	/*
+		HasBlockAndState checks whether both the specified parent block and its associated world state
+		(trie) are fully present and accessible in the node’s local database.
+
+		If either the parent block or its state is missing, this function returns false to
+		indicate the node must sync or fetch missing data before safely processing the new block.
+	*/
 	if !api.eth.BlockChain().HasBlockAndState(block.ParentHash(), block.NumberU64()-1) {
 		api.remoteBlocks.put(block.Hash(), block.Header())
 		log.Warn("State not available, ignoring new payload")
 		return engine.PayloadStatusV1{Status: engine.ACCEPTED}, nil
 	}
+
+	// Insert block without updating canonical head - full processing including execution, validation, and state update
+	// The canonical head is the latest block of the canonical chain—the single, agreed-upon main chain representing the current "truth" of the blockchain state.
+	// This is the block that all nodes recognize as the tip of the valid chain and build upon.
+	// The canonical chain is chosen by consensus rules (e.g., highest total difficulty, fork choice rule).
+	// The canonical head moves forward as new valid blocks are accepted and finalized.
 	log.Trace("Inserting block without sethead", "hash", block.Hash(), "number", block.Number())
 	proofs, err := api.eth.BlockChain().InsertBlockWithoutSetHead(block, witness)
 	if err != nil {
 		log.Warn("NewPayload: inserting block failed", "error", err)
-
+		// Record invalid block info for diagnostic and mitigation purposes
+		// The node stores information about that invalid block (like its hash and header),
+		// This info helps diagnose issues later and prevents the node from repeatedly trying to import the same bad block,
 		api.invalidLock.Lock()
 		api.invalidBlocksHits[block.Hash()] = 1
 		api.invalidTipsets[block.Hash()] = block.Header()
@@ -770,11 +838,21 @@ func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashe
 	hash := block.Hash()
 
 	// If witness collection was requested, inject that into the result too
+	/*
+		The witness is a cryptographic proof containing parts of the Ethereum state trie needed to verify all the state
+		accesses made by transactions in the block.
+
+		checks if witness proofs (cryptographic proofs of the Ethereum state accessed during block execution) were generated.
+		If yes, it serializes these proofs using standard Ethereum RLP encoding and packages them as hexadecimal bytes for sending
+		back to the consensus layer. These witnesses enable lightweight clients to verify block correctness without holding the full Ethereum state.
+	*/
 	var ow *hexutil.Bytes
 	if proofs != nil {
 		ow = new(hexutil.Bytes)
 		*ow, _ = rlp.EncodeToBytes(proofs)
 	}
+
+	// Return successful payload status with hash and optional witness data
 	return engine.PayloadStatusV1{Status: engine.VALID, Witness: ow, LatestValidHash: &hash}, nil
 }
 

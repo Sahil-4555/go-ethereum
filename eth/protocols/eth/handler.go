@@ -167,8 +167,11 @@ type Decoder interface {
 }
 
 var eth68 = map[uint64]msgHandler{
+	//We dropped support for non-merge networks
 	NewBlockHashesMsg:             handleNewBlockhashes,
+	// We dropped support for non-merge networks
 	NewBlockMsg:                   handleNewBlock,
+	// workk
 	TransactionsMsg:               handleTransactions,
 	NewPooledTransactionHashesMsg: handleNewPooledTransactionHashes,
 	GetBlockHeadersMsg:            handleGetBlockHeaders,

@@ -174,31 +174,46 @@ type Message struct {
 
 // TransactionToMessage converts a transaction into a Message.
 func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.Int) (*Message, error) {
+	// Create a new Message and copy important details from the transaction:
 	msg := &Message{
-		Nonce:                 tx.Nonce(),
-		GasLimit:              tx.Gas(),
-		GasPrice:              new(big.Int).Set(tx.GasPrice()),
-		GasFeeCap:             new(big.Int).Set(tx.GasFeeCap()),
-		GasTipCap:             new(big.Int).Set(tx.GasTipCap()),
-		To:                    tx.To(),
-		Value:                 tx.Value(),
-		Data:                  tx.Data(),
-		AccessList:            tx.AccessList(),
-		SetCodeAuthorizations: tx.SetCodeAuthorizations(),
-		SkipNonceChecks:       false,
-		SkipTransactionChecks: false,
-		BlobHashes:            tx.BlobHashes(),
-		BlobGasFeeCap:         tx.BlobGasFeeCap(),
+		Nonce:                 tx.Nonce(),                       // Unique number to prevent replay of the same transaction
+		GasLimit:              tx.Gas(),                         // Maximum gas that can be used by this transaction
+		GasPrice:              new(big.Int).Set(tx.GasPrice()),  // Price sender is willing to pay per gas unit
+		GasFeeCap:             new(big.Int).Set(tx.GasFeeCap()), // Max total gas price sender is willing to pay (EIP-1559)
+		GasTipCap:             new(big.Int).Set(tx.GasTipCap()), // Max priority fee (tip) to miners included in gas price (EIP-1559)
+		To:                    tx.To(),                          // Recipient address of the transaction
+		Value:                 tx.Value(),                       // Amount of Ether being sent
+		Data:                  tx.Data(),                        // Optional input data, often for smart contracts
+		AccessList:            tx.AccessList(),                  // Optional list of addresses and storage keys accessed by the transaction
+		SetCodeAuthorizations: tx.SetCodeAuthorizations(),       // Authorization info for contract code changes (if any)
+		SkipNonceChecks:       false,                            // Flag whether to skip nonce validation (default false)
+		SkipTransactionChecks: false,                            // Flag whether to skip transaction checks (default false)
+		BlobHashes:            tx.BlobHashes(),                  // Optional blobs of data (for new transaction types)
+		BlobGasFeeCap:         tx.BlobGasFeeCap(),               // Fee cap related to blobs (if any)
 	}
 	// If baseFee provided, set gasPrice to effectiveGasPrice.
+	// If a base fee per gas unit is provided (from the current block's fee market rules),
+	// calculate the effective gas price as base fee + tip fee.
 	if baseFee != nil {
+		// Calculate effective gas price: tip + base fee
 		msg.GasPrice = msg.GasPrice.Add(msg.GasTipCap, baseFee)
+		// Make sure it does not exceed the max total fee the sender is willing to pay
 		if msg.GasPrice.Cmp(msg.GasFeeCap) > 0 {
 			msg.GasPrice = msg.GasFeeCap
 		}
 	}
 	var err error
+	/*
+		// Sender returns the address derived from the signature (V, R, S) using secp256k1
+		// elliptic curve and an error if it failed deriving or upon an incorrect
+		// signature.
+		//
+		// Sender may cache the address, allowing it to be used regardless of
+		// signing method. The cache is invalidated if the cached signer does
+		// not match the signer used in the current call.
+	*/
 	msg.From, err = types.Sender(s, tx)
+	// Return the constructed Message along with any error from signature verification.
 	return msg, err
 }
 
@@ -210,7 +225,21 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 // indicates a core error meaning that the message would always fail for that particular
 // state and would never be accepted within a block.
 func ApplyMessage(evm *vm.EVM, msg *Message, gp *GasPool) (*ExecutionResult, error) {
+	// NewEVMTxContext creates a new transaction context for a single transaction.
+	// SetTxContext resets the EVM with a new transaction context.
+	// This is not threadsafe and should only be done very cautiously.
 	evm.SetTxContext(NewEVMTxContext(msg))
+	// newStateTransition initialises and returns a new state transition object.
+	// execute will transition the state by applying the current message and
+	// returning the evm execution result with following fields.
+	//
+	//   - used gas: total gas used (including gas being refunded)
+	//   - returndata: the returned data from evm
+	//   - concrete execution error: various EVM errors which abort the execution, e.g.
+	//     ErrOutOfGas, ErrExecutionReverted
+	//
+	// However if any consensus issue encountered, return the error directly with
+	// nil evm execution result.
 	return newStateTransition(evm, msg, gp).execute()
 }
 
@@ -263,45 +292,67 @@ func (st *stateTransition) to() common.Address {
 	return *st.msg.To
 }
 
+/*
+The buyGas function ensures the transaction sender has enough funds to cover the maximum possible
+gas cost of the transaction plus the transaction value itself. It calculates the worst-case gas cost
+considering current gas prices and any additional fees related to special blob data if applicable.
+It verifies the sender’s balance can support these costs, deducts the gas from the global gas pool,
+and finally subtracts the upfront gas cost from the sender’s balance in the state. Essentially,
+it "buys" the gas needed before the transaction runs to guarantee it can at least pay for execution costs.
+*/
 func (st *stateTransition) buyGas() error {
+	// Calculate max gas cost = gas limit * gas price
 	mgval := new(big.Int).SetUint64(st.msg.GasLimit)
 	mgval.Mul(mgval, st.msg.GasPrice)
+	// Initialize balanceCheck with gas cost
 	balanceCheck := new(big.Int).Set(mgval)
+	// If transaction specifies a max gas fee cap, use it in balance check instead
 	if st.msg.GasFeeCap != nil {
 		balanceCheck.SetUint64(st.msg.GasLimit)
 		balanceCheck = balanceCheck.Mul(balanceCheck, st.msg.GasFeeCap)
 	}
+	// Add the amount of ETH being sent in the transaction to the balance check
 	balanceCheck.Add(balanceCheck, st.msg.Value)
 
+	// If Cancun upgrade is active and blob gas is used, calculate additional fees
 	if st.evm.ChainConfig().IsCancun(st.evm.Context.BlockNumber, st.evm.Context.Time) {
 		if blobGas := st.blobGasUsed(); blobGas > 0 {
 			// Check that the user has enough funds to cover blobGasUsed * tx.BlobGasFeeCap
+			// Check that the sender can pay for blob gas usage using BlobGasFeeCap
 			blobBalanceCheck := new(big.Int).SetUint64(blobGas)
 			blobBalanceCheck.Mul(blobBalanceCheck, st.msg.BlobGasFeeCap)
 			balanceCheck.Add(balanceCheck, blobBalanceCheck)
 			// Pay for blobGasUsed * actual blob fee
+			// Add actual blob fee (blobGas * base blob fee) to max gas value
 			blobFee := new(big.Int).SetUint64(blobGas)
 			blobFee.Mul(blobFee, st.evm.Context.BlobBaseFee)
 			mgval.Add(mgval, blobFee)
 		}
 	}
+	// Convert balance check to 256-bit unsigned integer, ensure no overflow
 	balanceCheckU256, overflow := uint256.FromBig(balanceCheck)
 	if overflow {
 		return fmt.Errorf("%w: address %v required balance exceeds 256 bits", ErrInsufficientFunds, st.msg.From.Hex())
 	}
+	// Check if sender's balance covers the required balance
 	if have, want := st.state.GetBalance(st.msg.From), balanceCheckU256; have.Cmp(want) < 0 {
 		return fmt.Errorf("%w: address %v have %v want %v", ErrInsufficientFunds, st.msg.From.Hex(), have, want)
 	}
+	// Subtract the gas limit from the gas pool (deduct gas reservation)
 	if err := st.gp.SubGas(st.msg.GasLimit); err != nil {
 		return err
 	}
 
+	// Notify tracer about the initial gas deduction if tracer is enabled
 	if st.evm.Config.Tracer != nil && st.evm.Config.Tracer.OnGasChange != nil {
 		st.evm.Config.Tracer.OnGasChange(0, st.msg.GasLimit, tracing.GasChangeTxInitialBalance)
 	}
+	// Set remaining gas to full gas limit at start
 	st.gasRemaining = st.msg.GasLimit
 
+	// Remember initial gas for tracking
 	st.initialGas = st.msg.GasLimit
+	// Convert max gas value to 256-bit and deduct upfront gas cost from sender’s balance
 	mgvalU256, _ := uint256.FromBig(mgval)
 	st.state.SubBalance(st.msg.From, mgvalU256, tracing.BalanceDecreaseGasBuy)
 	return nil
@@ -309,28 +360,39 @@ func (st *stateTransition) buyGas() error {
 
 func (st *stateTransition) preCheck() error {
 	// Only check transactions that are not fake
+	// Only check real transactions, skip fake or special ones
 	msg := st.msg
 	if !msg.SkipNonceChecks {
 		// Make sure this transaction's nonce is correct.
-		stNonce := st.state.GetNonce(msg.From)
+		// Check if the transaction's nonce matches the expected nonce
+		// Nonce is like a transaction number for each user to keep order
+		stNonce := st.state.GetNonce(msg.From) // Current nonce on chain
 		if msgNonce := msg.Nonce; stNonce < msgNonce {
+			// Transaction nonce is higher than expected (too early)
 			return fmt.Errorf("%w: address %v, tx: %d state: %d", ErrNonceTooHigh,
 				msg.From.Hex(), msgNonce, stNonce)
 		} else if stNonce > msgNonce {
+			// Transaction nonce is lower than expected (already used)
 			return fmt.Errorf("%w: address %v, tx: %d state: %d", ErrNonceTooLow,
 				msg.From.Hex(), msgNonce, stNonce)
 		} else if stNonce+1 < stNonce {
+			// Nonce overflow error (extremely unlikely)
 			return fmt.Errorf("%w: address %v, nonce: %d", ErrNonceMax,
 				msg.From.Hex(), stNonce)
 		}
 	}
+
+	// Check if the current network upgrade is Osaka (for new rules)
 	isOsaka := st.evm.ChainConfig().IsOsaka(st.evm.Context.BlockNumber, st.evm.Context.Time)
 	if !msg.SkipTransactionChecks {
 		// Verify tx gas limit does not exceed EIP-7825 cap.
+		// Make sure gas limit does not exceed max allowed after EIP-7825
 		if isOsaka && msg.GasLimit > params.MaxTxGas {
 			return fmt.Errorf("%w (cap: %d, tx: %d)", ErrGasLimitTooHigh, params.MaxTxGas, msg.GasLimit)
 		}
 		// Make sure the sender is an EOA
+		// Verify sender is an Externally Owned Account (regular user, not a contract),
+		// unless it's a delegated signature
 		code := st.state.GetCode(msg.From)
 		_, delegated := types.ParseDelegation(code)
 		if len(code) > 0 && !delegated {
@@ -338,10 +400,13 @@ func (st *stateTransition) preCheck() error {
 		}
 	}
 	// Make sure that transaction gasFeeCap is greater than the baseFee (post london)
+	// For London and later upgrades, check that gas fee caps are valid and sufficient
 	if st.evm.ChainConfig().IsLondon(st.evm.Context.BlockNumber) {
 		// Skip the checks if gas fields are zero and baseFee was explicitly disabled (eth_call)
+		// Skip checks if base fee is disabled and gas fields are zero (e.g. eth_call)
 		skipCheck := st.evm.Config.NoBaseFee && msg.GasFeeCap.BitLen() == 0 && msg.GasTipCap.BitLen() == 0
 		if !skipCheck {
+			// Gas fee cap and tip must not be absurdly large
 			if l := msg.GasFeeCap.BitLen(); l > 256 {
 				return fmt.Errorf("%w: address %v, maxFeePerGas bit length: %d", ErrFeeCapVeryHigh,
 					msg.From.Hex(), l)
@@ -350,12 +415,14 @@ func (st *stateTransition) preCheck() error {
 				return fmt.Errorf("%w: address %v, maxPriorityFeePerGas bit length: %d", ErrTipVeryHigh,
 					msg.From.Hex(), l)
 			}
+			// Gas tip must not exceed total gas fee cap
 			if msg.GasFeeCap.Cmp(msg.GasTipCap) < 0 {
 				return fmt.Errorf("%w: address %v, maxPriorityFeePerGas: %s, maxFeePerGas: %s", ErrTipAboveFeeCap,
 					msg.From.Hex(), msg.GasTipCap, msg.GasFeeCap)
 			}
 			// This will panic if baseFee is nil, but basefee presence is verified
 			// as part of header validation.
+			// Gas fee cap must be at least the current base fee
 			if msg.GasFeeCap.Cmp(st.evm.Context.BaseFee) < 0 {
 				return fmt.Errorf("%w: address %v, maxFeePerGas: %s, baseFee: %s", ErrFeeCapTooLow,
 					msg.From.Hex(), msg.GasFeeCap, st.evm.Context.BaseFee)
@@ -363,19 +430,24 @@ func (st *stateTransition) preCheck() error {
 		}
 	}
 	// Check the blob version validity
+	// If transaction uses blob data (newer feature), validate blob hashes and counts
 	if msg.BlobHashes != nil {
 		// The to field of a blob tx type is mandatory, and a `BlobTx` transaction internally
 		// has it as a non-nillable value, so any msg derived from blob transaction has it non-nil.
 		// However, messages created through RPC (eth_call) don't have this restriction.
+		// Ensure there is a recipient address for blob transactions
 		if msg.To == nil {
 			return ErrBlobTxCreate
 		}
+		// Must have at least one blob hash
 		if len(msg.BlobHashes) == 0 {
 			return ErrMissingBlobHashes
 		}
+		// Limit number of blobs for Osaka upgrade
 		if isOsaka && len(msg.BlobHashes) > params.BlobTxMaxBlobs {
 			return ErrTooManyBlobs
 		}
+		// Each blob hash must be correctly formed with valid version
 		for i, hash := range msg.BlobHashes {
 			if !kzg4844.IsValidVersionedHash(hash[:]) {
 				return fmt.Errorf("blob %d has invalid hash version", i)
@@ -383,13 +455,16 @@ func (st *stateTransition) preCheck() error {
 		}
 	}
 	// Check that the user is paying at least the current blob fee
+	// If Cancun upgrade is active and blob gas is used, verify blob fee caps
 	if st.evm.ChainConfig().IsCancun(st.evm.Context.BlockNumber, st.evm.Context.Time) {
 		if st.blobGasUsed() > 0 {
 			// Skip the checks if gas fields are zero and blobBaseFee was explicitly disabled (eth_call)
+			// Skip if blob base fee is disabled and fee caps are zero
 			skipCheck := st.evm.Config.NoBaseFee && msg.BlobGasFeeCap.BitLen() == 0
 			if !skipCheck {
 				// This will panic if blobBaseFee is nil, but blobBaseFee presence
 				// is verified as part of header validation.
+				// Blob gas fee cap must at least match the base blob fee
 				if msg.BlobGasFeeCap.Cmp(st.evm.Context.BlobBaseFee) < 0 {
 					return fmt.Errorf("%w: address %v blobGasFeeCap: %v, blobBaseFee: %v", ErrBlobFeeCapTooLow,
 						msg.From.Hex(), msg.BlobGasFeeCap, st.evm.Context.BlobBaseFee)
@@ -398,14 +473,18 @@ func (st *stateTransition) preCheck() error {
 		}
 	}
 	// Check that EIP-7702 authorization list signatures are well formed.
+	// If the transaction sets authorization lists (EIP-7702), ensure they are well-formed
 	if msg.SetCodeAuthorizations != nil {
+		// Must have a recipient for this type of transaction
 		if msg.To == nil {
 			return fmt.Errorf("%w (sender %v)", ErrSetCodeTxCreate, msg.From)
 		}
+		// Authorization list cannot be empty
 		if len(msg.SetCodeAuthorizations) == 0 {
 			return fmt.Errorf("%w (sender %v)", ErrEmptyAuthList, msg.From)
 		}
 	}
+	// Finally, attempt to buy gas with the provided fee (checks balance etc)
 	return st.buyGas()
 }
 
@@ -430,7 +509,13 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 	// 5. there is no overflow when calculating intrinsic gas
 	// 6. caller has enough balance to cover asset transfer for **topmost** call
 
-	// Check clauses 1-3, buy gas if everything is correct
+	// ------ Check clauses 1-3, buy gas if everything is correct ------
+	/*The preCheck function performs early validations before a transaction is executed.
+	It checks that the transaction nonce is in the correct sequence, validates gas limits
+	and fees against current network rules, ensures the sender is a regular externally owned account (EOA),
+	verifies blob transaction details if any, and confirms that authorization data (if present) is well-formed.
+	These checks help prevent invalid or malformed transactions from consuming resources and ensure they
+	conform to protocol rules before processing.*/
 	if err := st.preCheck(); err != nil {
 		return nil, err
 	}

@@ -57,78 +57,160 @@ func (p *StateProcessor) chainConfig() *params.ChainConfig {
 // Process returns the receipts and logs accumulated during the process and
 // returns the amount of gas that was used in the process. If any of the
 // transactions failed to execute due to insufficient gas it will return an error.
+/*
+Process runs all transactions in a block following Ethereum rules and updates the state accordingly.
+
+- It starts by loading the chain configuration and initializing gas tracking and receipts storage.
+- If the block is the special DAO fork block, apply the DAO hard fork changes (e.g., refunding DAO balances).
+- It creates a signer specific to the block’s fork rules to verify transactions correctly.
+- A state wrapper with optional tracing hooks is prepared for monitoring execution.
+- The EVM context and instance are created with the current block and chain settings.
+- If the block contains special beacon root info, it is processed by a system call.
+- For recent forks like Prague and Verkle, parent block hash is stored as required by new consensus rules.
+
+Then, it processes each transaction in the block one by one:
+- Converts the transaction into a message format for the EVM.
+- Sets the current transaction context on the state.
+- Applies the transaction using the EVM, updating state and accumulating gas used.
+- Collects receipts and logs for each transaction.
+
+If the Prague fork is active:
+- Parses deposit logs from transactions and adds them to the requests list.
+- Processes withdrawal and consolidation queues via system contract calls, updating the requests.
+
+Finally:
+- Calls the consensus engine’s Finalize method to apply final block changes like miner rewards.
+- Returns the combined results: receipts, logs, any special requests, and total gas used.
+
+This function ensures all Ethereum protocol rules and fork-specific features are applied during block execution.
+*/
 func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg vm.Config) (*ProcessResult, error) {
 	var (
-		config      = p.chainConfig()
-		receipts    types.Receipts
-		usedGas     = new(uint64)
+		// Load the chain configuration for using fork-specific rules
+		config = p.chainConfig()
+		// Prepare to collect receipts
+		receipts types.Receipts
+		// Track total gas used by the block
+		usedGas = new(uint64)
+		// Get block header, hash, and number for reference
 		header      = block.Header()
 		blockHash   = block.Hash()
 		blockNumber = block.Number()
-		allLogs     []*types.Log
-		gp          = new(GasPool).AddGas(block.GasLimit())
+		// Prepare to collect  logs of transactions
+		allLogs []*types.Log
+		// Initialize GasPool to track gas limit for block execution
+		gp = new(GasPool).AddGas(block.GasLimit())
 	)
 
 	// Mutate the block and state according to any hard-fork specs
+	// If this block matches the DAO fork block, apply the DAO Hard Fork balance changes
 	if config.DAOForkSupport && config.DAOForkBlock != nil && config.DAOForkBlock.Cmp(block.Number()) == 0 {
 		misc.ApplyDAOHardFork(statedb)
 	}
 	var (
 		context vm.BlockContext
-		signer  = types.MakeSigner(config, header.Number, header.Time)
+		// MakeSigner returns a Signer based on the given chain config and block number.
+		// Create a signer to verify transactions, based on the block number and fork rules
+		signer = types.MakeSigner(config, header.Number, header.Time)
 	)
 
 	// Apply pre-execution system calls.
+	// Wrap statedb with tracing hooks if configured, for debugging and monitoring
 	var tracingStateDB = vm.StateDB(statedb)
 	if hooks := cfg.Tracer; hooks != nil {
 		tracingStateDB = state.NewHookedState(statedb, hooks)
 	}
+	// Create the EVM execution context for this block
 	context = NewEVMBlockContext(header, p.chain, nil)
+	// Instantiate a new EVM with the context, state DB, chain config, and VM config
 	evm := vm.NewEVM(context, tracingStateDB, config, cfg)
 
+	// Process beacon block root info if present (for consensus-specific logic)
 	if beaconRoot := block.BeaconRoot(); beaconRoot != nil {
 		ProcessBeaconBlockRoot(*beaconRoot, evm)
 	}
+	// For Prague or Verkle forks, store parent block hash as required by updated consensus rules
 	if config.IsPrague(block.Number(), block.Time()) || config.IsVerkle(block.Number(), block.Time()) {
 		ProcessParentBlockHash(block.ParentHash(), evm)
 	}
 
 	// Iterate over and process the individual transactions
+	// Loop through each transaction in the block for processing
 	for i, tx := range block.Transactions() {
+		// Convert transaction format to EVM message format, using signer and block base fee
 		msg, err := TransactionToMessage(tx, signer, header.BaseFee)
 		if err != nil {
 			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 		}
+		// Set the current transaction context (hash and index) on the stateDB
+		// SetTxContext sets the current transaction hash and index which are
+		// used when the EVM emits new state logs. It should be invoked before
+		// transaction execution.
 		statedb.SetTxContext(tx.Hash(), i)
 
+		// Apply the transaction using the EVM, gas pool, block info, and accumulating used gas
 		receipt, err := ApplyTransactionWithEVM(msg, gp, statedb, blockNumber, blockHash, context.Time, tx, usedGas, evm)
 		if err != nil {
 			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 		}
+		// Collect the receipt and logs for this transaction
 		receipts = append(receipts, receipt)
 		allLogs = append(allLogs, receipt.Logs...)
 	}
 	// Read requests if Prague is enabled.
+	// Prepare to collect any special "requests" if Prague upgrade rules apply
 	var requests [][]byte
 	if config.IsPrague(block.Number(), block.Time()) {
 		requests = [][]byte{}
 		// EIP-6110
+		// Parse deposit logs (EIP-6110) from receipts' logs
+		/*
+			- This EIP integrates validator deposits directly into the Ethereum Execution Layer blocks, eliminating
+			the previous deposit voting mechanism in the Consensus Layer.
+			- It streamlines deposit processing by including validator deposits as a list of deposit operations in the
+			execution layer, enhancing security, reducing delays, and simplifying client software design.​
+		*/
 		if err := ParseDepositLogs(&requests, allLogs, config); err != nil {
 			return nil, fmt.Errorf("failed to parse deposit logs: %w", err)
 		}
 		// EIP-7002
+		// Process withdrawal queue contract (EIP-7002)
+		/*
+			- This EIP allows validators to trigger withdrawals and exits using their execution
+			  layer withdrawal credentials.
+			- It enables validators to submit withdrawal requests through a queue system in a
+			contract, bypassing the need for active signing keys to initiate exits.
+			- It introduces a queue with rate-limiting and fee adjustments to handle withdrawal
+			requests systematically, improving validator autonomy and security.
+		*/
 		if err := ProcessWithdrawalQueue(&requests, evm); err != nil {
 			return nil, fmt.Errorf("failed to process withdrawal queue: %w", err)
 		}
 		// EIP-7251
+		// Process consolidation queue contract (EIP-7251)
+		/*
+			- Processes the consolidation queue contract.
+
+			- This EIP increases the maximum effective staking balance per validator beyond the previous
+			32 ETH limit (potentially up to 2048 ETH).
+
+			- It allows large validators to consolidate stakes into fewer accounts, reducing the number
+			 of validators and improving Ethereum's scalability and efficiency while maintaining decentralization.
+
+			- Introduces protocol mechanisms for merging balances via consolidation requests
+			 processed through a queue contract
+		*/
 		if err := ProcessConsolidationQueue(&requests, evm); err != nil {
 			return nil, fmt.Errorf("failed to process consolidation queue: %w", err)
 		}
 	}
 
 	// Finalize the block, applying any consensus engine specific extras (e.g. block rewards)
+	// Call consensus engine to finalize the block,
+	// applying any mining rewards, uncle rewards, or other state changes
 	p.chain.Engine().Finalize(p.chain, header, tracingStateDB, block.Body())
 
+	// Return the final results of processing the block
 	return &ProcessResult{
 		Receipts: receipts,
 		Requests: requests,
@@ -141,33 +223,51 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 // and uses the input parameters for its environment similar to ApplyTransaction. However,
 // this method takes an already created EVM instance as input.
 func ApplyTransactionWithEVM(msg *Message, gp *GasPool, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, blockTime uint64, tx *types.Transaction, usedGas *uint64, evm *vm.EVM) (receipt *types.Receipt, err error) {
+	// If tracing hooks are set (for debugging or monitoring), notify the start of this transaction execution.
 	if hooks := evm.Config.Tracer; hooks != nil {
 		if hooks.OnTxStart != nil {
-			hooks.OnTxStart(evm.GetVMContext(), tx, msg.From)
+			hooks.OnTxStart(evm.GetVMContext(), tx, msg.From) // Signal transaction start
 		}
+		// Arrange to notify when this transaction finishes, including the receipt and error status.
 		if hooks.OnTxEnd != nil {
 			defer func() { hooks.OnTxEnd(receipt, err) }()
 		}
 	}
 	// Apply the transaction to the current state (included in the env).
-	result, err := ApplyMessage(evm, msg, gp)
+	/*
+		// ApplyMessage computes the new state by applying the given message
+		// against the old state within the environment.
+		//
+		// ApplyMessage returns the bytes returned by any EVM execution (if it took place),
+		// the gas used (which includes gas refunds) and an error if it failed. An error always
+		// indicates a core error meaning that the message would always fail for that particular
+		// state and would never be accepted within a block.
+	*/
+	result, err := ApplyMessage(evm, msg, gp) // This executes the contract logic or transfer
 	if err != nil {
-		return nil, err
+		return nil, err // Return if something went wrong during execution
 	}
 	// Update the state with pending changes.
+	// Update the blockchain state according to the rules of the current protocol.
 	var root []byte
 	if evm.ChainConfig().IsByzantium(blockNumber) {
+		// For blocks after the Byzantium fork, finalize the state with intermediate changes.
 		evm.StateDB.Finalise(true)
 	} else {
+		// For earlier blocks, compute the intermediate root of state trie.
 		root = statedb.IntermediateRoot(evm.ChainConfig().IsEIP158(blockNumber)).Bytes()
 	}
+	// Add the gas used by this transaction to the total gas counter.
 	*usedGas += result.UsedGas
 
 	// Merge the tx-local access event into the "block-local" one, in order to collect
 	// all values, so that the witness can be built.
+	/* If the system uses the newer Verkle trie structure, merge this transaction's access events
+	   with the block-level collection to later build proofs efficiently. */
 	if statedb.Database().TrieDB().IsVerkle() {
 		statedb.AccessEvents().Merge(evm.AccessEvents)
 	}
+	// Create and return a receipt summarizing the transaction outcome and state changes.
 	return MakeReceipt(evm, result, statedb, blockNumber, blockHash, blockTime, tx, *usedGas, root), nil
 }
 
