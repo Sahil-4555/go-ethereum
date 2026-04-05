@@ -446,6 +446,9 @@ func (sim *simulator) sanitizeCall(call *TransactionArgs, state vm.StateDB, head
 	// Let the call run wild unless explicitly specified.
 	remaining := gp.Gas()
 	if call.Gas == nil {
+		if sim.validate && sim.chainConfig.IsOsaka(header.Number, header.Time) && !sim.chainConfig.IsAmsterdam(header.Number, header.Time) && remaining > params.MaxTxGas {
+			remaining = params.MaxTxGas
+		}
 		call.Gas = (*hexutil.Uint64)(&remaining)
 	}
 	if remaining < uint64(*call.Gas) {

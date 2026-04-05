@@ -2493,6 +2493,80 @@ func TestSimulateV1(t *testing.T) {
 	}
 }
 
+func TestSimulateSanitizeCallDefaultGas(t *testing.T) {
+	t.Parallel()
+
+	const gasUsed = uint64(100)
+	const blockTime = uint64(1)
+
+	blockGasLimit := params.MaxTxGas + 1000 + gasUsed
+	remaining := blockGasLimit - gasUsed
+
+	osakaConfig := *params.MergedTestChainConfig
+	osakaConfig.AmsterdamTime = nil
+	amsterdamConfig := *params.MergedTestChainConfig
+	amsterdamTime := uint64(0)
+	amsterdamConfig.AmsterdamTime = &amsterdamTime
+
+	tests := []struct {
+		name    string
+		sim     *simulator
+		wantGas uint64
+	}{
+		{
+			name: "validation mode caps default gas at Osaka tx limit",
+			sim: &simulator{
+				chainConfig: &osakaConfig,
+				budget:      newGasBudget(0),
+				validate:    true,
+			},
+			wantGas: params.MaxTxGas,
+		},
+		{
+			name: "non-validation mode keeps block remaining gas",
+			sim: &simulator{
+				chainConfig: &osakaConfig,
+				budget:      newGasBudget(0),
+			},
+			wantGas: remaining,
+		},
+		{
+			name: "amsterdam keeps full block remaining gas in validation mode",
+			sim: &simulator{
+				chainConfig: &amsterdamConfig,
+				budget:      newGasBudget(0),
+				validate:    true,
+			},
+			wantGas: remaining,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			nonce := hexutil.Uint64(0)
+			call := TransactionArgs{Nonce: &nonce}
+			header := &types.Header{
+				Number:  big.NewInt(1),
+				Time:    blockTime,
+				BaseFee: big.NewInt(0),
+			}
+			gp := core.NewGasPool(blockGasLimit)
+			require.NoError(t, gp.SubGas(gasUsed))
+
+			_, err := tc.sim.sanitizeCall(&call, nil, header, gp)
+			if err != nil {
+				t.Fatalf("sanitizeCall failed: %v", err)
+			}
+			if call.Gas == nil {
+				t.Fatal("expected gas to be populated")
+			}
+			if got := uint64(*call.Gas); got != tc.wantGas {
+				t.Fatalf("unexpected default gas: got %d want %d", got, tc.wantGas)
+			}
+		})
+	}
+}
+
 func TestSimulateV1ChainLinkage(t *testing.T) {
 	var (
 		acc          = newTestAccount()
